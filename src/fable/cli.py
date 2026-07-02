@@ -10,6 +10,15 @@
     fable review    weekly review: moved / stale / open criticals
     fable capture   end-of-session: decided / learned / next action
     fable init      write a config file and explain Notion setup
+
+\b
+PM layer:
+    fable delegate  hand a task to someone (@person, waiting-since date)
+    fable waiting   who owes you what, with nudge flags
+    fable blockers  dependency graph over the tracker — what unblocks what
+    fable decide    log a decision + the why (retrievable later)
+    fable rice      score a bet (reach x impact x confidence / effort) and log it
+    fable log       read recent decisions/captures from the Notion log
 """
 
 from __future__ import annotations
@@ -37,6 +46,25 @@ def _store(ctx: click.Context) -> Store:
         return Store(ctx.obj)
     except NotionError as exc:
         raise click.ClickException(str(exc))
+
+
+def _log_entry(ctx: click.Context, heading: str, sections: dict[str, str]) -> None:
+    """Append an entry to the Notion log page, or captures.md when unconfigured."""
+    cfg: Config = ctx.obj
+    if cfg.log_page:
+        _store(ctx).append_capture(cfg.log_page, heading, sections)
+        console.print("[green]Logged to Notion.[/green]")
+        return
+    path = Path("captures.md")
+    with path.open("a") as fh:
+        fh.write(f"\n### {heading}\n")
+        for label, text in sections.items():
+            if text.strip():
+                fh.write(f"- **{label}:** {text.strip()}\n")
+    console.print(
+        f"[yellow]No log_page configured — appended to {path}.[/yellow] "
+        "Set FABLE_LOG_PAGE or log_page in fable.toml to log into Notion."
+    )
 
 
 def _resolve(tasks: list[model.Task], query: str) -> model.Task:
@@ -94,6 +122,17 @@ def brief(ctx: click.Context) -> None:
     if criticals:
         render.section("Launch tracker — critical/high open")
         console.print(render.task_table(criticals, today, now))
+        leverage = model.top_leverage(tracker)
+        if leverage and len(leverage[1]) > 1:
+            blocker, blocked = leverage
+            console.print(
+                f"  [bold]Leverage:[/bold] finishing [cyan]{blocker.title}[/cyan] "
+                f"unblocks {len(blocked)} tasks."
+            )
+    waiting = model.waiting_list(todos, now)
+    if waiting:
+        render.section(f"Waiting on ({len(waiting)})")
+        console.print(render.waiting_table(waiting, now))
     if doing:
         render.section(f"In flight ({len(doing)})")
         console.print(render.task_table(doing[:8], today, now))
@@ -134,16 +173,24 @@ def list_cmd(ctx: click.Context, show_all: bool) -> None:
 @click.option("-p", "--priority", type=click.Choice(["P0", "P1", "P2"]), help="Priority tag.")
 @click.option("--deep/--shallow", "deep", default=None, help="Energy tag for time-slot matching.")
 @click.option("-n", "--note", default="", help="Short note.")
+@click.option("--to", "assignee", default=None, help="Delegate on creation (@person tag).")
 @click.pass_context
 def add(ctx: click.Context, title: str, due: datetime | None, priority: str | None,
-        deep: bool | None, note: str) -> None:
+        deep: bool | None, note: str, assignee: str | None) -> None:
     """Capture a task into the To Do database."""
+    cfg: Config = ctx.obj
     store = _store(ctx)
     energy = None if deep is None else ("deep" if deep else "shallow")
+    if assignee:
+        tag = f"@{assignee.lower()} · waiting since {_now(cfg).date().isoformat()}"
+        note = f"{note} · {tag}".strip(" ·") if note else tag
     task = store.add_todo(
         title, due=due.date() if due else None, notes=note, priority=priority, energy=energy
     )
-    bits = " ".join(filter(None, [priority, energy, f"due {due.date()}" if due else ""]))
+    bits = " ".join(filter(None, [
+        priority, energy, f"→ @{assignee.lower()}" if assignee else "",
+        f"due {due.date()}" if due else "",
+    ]))
     console.print(f"[green]Captured:[/green] {task.title}" + (f"  [dim]{bits}[/dim]" if bits else ""))
 
 
@@ -234,28 +281,137 @@ def capture(ctx: click.Context, project: str) -> None:
         return
 
     now = _now(cfg)
-    heading = now.strftime("%Y-%m-%d %H:%M") + (f" — {project}" if project else "")
+    heading = "Session " + now.strftime("%Y-%m-%d %H:%M") + (f" — {project}" if project else "")
     sections = {"Decided": decided, "Learned": learned, "Next": next_action}
-
-    if cfg.log_page:
-        store = _store(ctx)
-        store.append_capture(cfg.log_page, heading, sections)
-        console.print("[green]Captured to Notion log.[/green]")
-    else:
-        path = Path("captures.md")
-        with path.open("a") as fh:
-            fh.write(f"\n### {heading}\n")
-            for label, text in sections.items():
-                if text.strip():
-                    fh.write(f"- **{label}:** {text.strip()}\n")
-        console.print(
-            f"[yellow]No log_page configured — appended to {path}.[/yellow] "
-            "Set FABLE_LOG_PAGE or log_page in fable.toml to capture into Notion."
-        )
+    _log_entry(ctx, heading, sections)
     if next_action.strip() and click.confirm("Add the next action as a task?", default=True):
         store = _store(ctx)
         store.add_todo(next_action.strip(), notes=f"From session capture {heading}")
         console.print(f"[green]Captured:[/green] {next_action.strip()}")
+
+
+@main.command()
+@click.argument("query")
+@click.option("--to", "person", required=True, help="Who takes it (e.g. noah).")
+@click.pass_context
+def delegate(ctx: click.Context, query: str, person: str) -> None:
+    """Hand an existing task to someone and start the waiting clock."""
+    cfg: Config = ctx.obj
+    store = _store(ctx)
+    task = _resolve(store.open_todos(), query)
+    store.delegate(task, person, _now(cfg).date())
+    console.print(f"[cyan]Delegated to @{person.lower()}:[/cyan] {task.title}")
+
+
+@main.command()
+@click.option("--nudge-days", default=3, help="Flag waits at or beyond this many days.")
+@click.pass_context
+def waiting(ctx: click.Context, nudge_days: int) -> None:
+    """Who owes you what — delegated tasks, longest wait first."""
+    cfg: Config = ctx.obj
+    now = _now(cfg)
+    tasks = model.waiting_list(_store(ctx).open_todos(), now)
+    if not tasks:
+        console.print("[green]Waiting on nobody. Everything is yours.[/green]")
+        return
+    render.section(f"Waiting on ({len(tasks)})")
+    console.print(render.waiting_table(tasks, now, nudge_days))
+    overdue = [t for t in tasks if (t.wait_days(now) or 0) >= nudge_days]
+    if overdue:
+        console.print(f"\n[bold yellow]{len(overdue)} need a nudge today.[/bold yellow]")
+
+
+@main.command()
+@click.pass_context
+def blockers(ctx: click.Context) -> None:
+    """Dependency graph over the tracker: what unblocks what."""
+    cfg: Config = ctx.obj
+    now = _now(cfg)
+    tracker = _store(ctx).open_tracker()
+    graph, unresolved = model.blocker_graph(tracker)
+    if not graph and not unresolved:
+        console.print("[green]No open dependencies on the tracker.[/green]")
+        return
+    for blocker, blocked in sorted(graph.values(), key=lambda p: len(p[1]), reverse=True):
+        render.section(f"{blocker.title}  [dim]({blocker.status}, unblocks {len(blocked)})[/dim]")
+        console.print(render.task_table(blocked, now.date(), now))
+    if unresolved:
+        render.section("Unmatched dependencies (done, external, or too vague)")
+        for task, name in unresolved:
+            console.print(f"  [dim]{task.title} ← '{name}'[/dim]")
+    console.print()
+
+
+@main.command()
+@click.argument("decision")
+@click.option("--why", default="", help="The reasoning — matters as much as the outcome.")
+@click.option("--project", default="", help="Project this belongs to.")
+@click.pass_context
+def decide(ctx: click.Context, decision: str, why: str, project: str) -> None:
+    """Log a decision with its reasoning."""
+    cfg: Config = ctx.obj
+    heading = "Decision " + _now(cfg).strftime("%Y-%m-%d") + (f" — {project}" if project else "")
+    _log_entry(ctx, heading, {"Decision": decision, "Why": why})
+
+
+@main.command()
+@click.argument("name")
+@click.option("-r", "--reach", type=float, required=True, help="People/accounts per quarter.")
+@click.option("-i", "--impact", type=float, required=True,
+              help="0.25 minimal / 0.5 low / 1 medium / 2 high / 3 massive.")
+@click.option("-c", "--confidence", type=float, required=True, help="0-1 (e.g. 0.8).")
+@click.option("-e", "--effort", type=float, required=True, help="Person-weeks.")
+@click.option("--project", default="", help="Project this bet belongs to.")
+@click.pass_context
+def rice(ctx: click.Context, name: str, reach: float, impact: float, confidence: float,
+         effort: float, project: str) -> None:
+    """Score a bet with RICE and log it."""
+    cfg: Config = ctx.obj
+    try:
+        score = model.rice_score(reach, impact, confidence, effort)
+    except ValueError as exc:
+        raise click.ClickException(str(exc))
+    console.print(f"\n[bold]{name}[/bold]")
+    console.print(
+        f"  RICE = {reach:g} × {impact:g} × {confidence:g} / {effort:g} "
+        f"= [bold cyan]{score:.1f}[/bold cyan]\n"
+    )
+    heading = "RICE " + _now(cfg).strftime("%Y-%m-%d") + (f" — {project}" if project else "")
+    _log_entry(ctx, heading, {
+        "Bet": name,
+        "Score": f"{score:.1f} (R {reach:g} × I {impact:g} × C {confidence:g} / E {effort:g})",
+    })
+
+
+@main.command("log")
+@click.option("-n", "--entries", default=5, help="How many recent entries to show.")
+@click.pass_context
+def log_cmd(ctx: click.Context, entries: int) -> None:
+    """Read recent decisions/captures back from the Notion log page."""
+    cfg: Config = ctx.obj
+    if not cfg.log_page:
+        raise click.ClickException(
+            "No log_page configured. Set FABLE_LOG_PAGE or log_page in fable.toml."
+        )
+    blocks = _store(ctx).read_log(cfg.log_page)
+    # entries are heading + items; walk from the end, keep the last N headings
+    kept: list[tuple[str, str]] = []
+    headings = 0
+    for kind, text in reversed(blocks):
+        kept.append((kind, text))
+        if kind == "heading":
+            headings += 1
+            if headings >= entries:
+                break
+    if not kept:
+        console.print("[dim]Log is empty.[/dim]")
+        return
+    for kind, text in reversed(kept):
+        if kind == "heading":
+            console.print(f"\n[bold]{text}[/bold]")
+        else:
+            console.print(f"  {text}")
+    console.print()
 
 
 @main.command()

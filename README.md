@@ -47,6 +47,34 @@ fable review                # shipped this week, stale pile, open criticals
 fable stale                 # any time: in-flight tasks untouched 7+ days
 ```
 
+## PM layer
+
+A PM's day is mostly other people's work and decisions, not their own tasks.
+These commands cover that:
+
+```sh
+fable delegate "onboarding wizard" --to noah   # start the waiting clock
+fable add "Review audit design" --to elise     # delegate on creation
+fable waiting                                  # who owes you what; nudge flags at 3d
+fable blockers                                 # tracker dependency graph: what unblocks what
+fable decide "Ship Segment A first" --why "39 interviews say ad-spend pain is sharpest" --project "Falora GTM"
+fable rice "NL2SQL self-serve" -r 200 -i 2 -c 0.8 -e 4
+fable log -n 5                                 # read recent decisions back
+```
+
+- **Delegation** is a plain-text tag in Notes (`@noah · waiting since
+  2026-07-02`) — visible in Notion, no schema change. `fable waiting` sorts by
+  wait time and flags anything at 3+ days as needing a nudge. The morning
+  `brief` includes the same list.
+- **Blockers** parses the tracker's free-text Dependencies field ("Blocked
+  by: X", "After: Y") and matches it to open tasks by title/workstream token
+  overlap. The brief prints the leverage line: the one task whose completion
+  unblocks the most others. Unmatched dependencies are listed separately
+  instead of silently dropped.
+- **Decisions and RICE scores** go to the same Notion log page as session
+  captures, so `fable log` is the searchable memory of *why* things were
+  chosen — the part that's usually lost.
+
 ## How prioritization works
 
 - **The one thing** in `fable brief` is picked in this order: overdue P0 →

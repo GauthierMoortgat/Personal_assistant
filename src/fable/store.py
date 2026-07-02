@@ -54,6 +54,32 @@ class Store:
     def set_status(self, task: Task, status: str) -> None:
         self.notion.update_page(task.id, {"Status": {"status": {"name": status}}})
 
+    def set_notes(self, task: Task, notes: str) -> None:
+        self.notion.update_page(
+            task.id, {"Notes": {"rich_text": [{"text": {"content": notes}}]}}
+        )
+
+    def delegate(self, task: Task, person: str, today: date) -> str:
+        """Tag a task as delegated: '@person · waiting since YYYY-MM-DD' in Notes."""
+        tag = f"@{person.lower()} · waiting since {today.isoformat()}"
+        notes = f"{task.notes} · {tag}".strip(" ·") if task.notes else tag
+        self.set_notes(task, notes)
+        return notes
+
+    def read_log(self, page_id: str) -> list[tuple[str, str]]:
+        """Log page blocks as (kind, text): kind is 'heading' or 'item'."""
+        from .notion import plain_text
+
+        out: list[tuple[str, str]] = []
+        for block in self.notion.get_block_children(page_id):
+            kind = block.get("type", "")
+            payload = block.get(kind) or {}
+            text = plain_text(payload.get("rich_text", []))
+            if not text:
+                continue
+            out.append(("heading" if kind.startswith("heading") else "item", text))
+        return out
+
     def append_capture(self, page_id: str, heading: str, sections: dict[str, str]) -> None:
         """Append an end-of-session capture to the log page."""
         children: list[dict] = [

@@ -13,6 +13,12 @@ from .notion import prop_value
 
 PRIORITY_RE = re.compile(r"\bP([012])\b")
 ENERGY_RE = re.compile(r"\b(deep|shallow)\b", re.IGNORECASE)
+DELEGATE_RE = re.compile(r"@([\w-]+)")
+WAITING_SINCE_RE = re.compile(r"waiting since (\d{4}-\d{2}-\d{2})")
+DEP_RE = re.compile(r"(?:blocked by|after)\s*:\s*([^;\n]+)", re.IGNORECASE)
+# tokens too generic to identify a task when matching dependency text to titles
+STOPWORDS = {"the", "and", "for", "all", "into", "one", "per", "new", "own",
+             "van", "de", "het", "een", "voor"}
 
 # Statuses that count as "open" per source database
 OPEN_TODO = ("To do", "Doing", "In review")
@@ -34,6 +40,8 @@ class Task:
     workstream: str | None = None
     dependencies: str = ""
     task_id: str | None = None
+    delegated_to: str | None = None
+    waiting_since: date | None = None
 
     @property
     def open(self) -> bool:
@@ -47,6 +55,12 @@ class Task:
         if not self.last_edited:
             return None
         return (now - self.last_edited).days
+
+    def wait_days(self, now: datetime) -> int | None:
+        """Days since the task was handed off (falls back to last edit)."""
+        if self.waiting_since:
+            return (now.date() - self.waiting_since).days
+        return self.days_since_edit(now)
 
 
 def _parse_date(value: str | None) -> date | None:
@@ -78,6 +92,22 @@ def parse_energy(*texts: str) -> str | None:
     return None
 
 
+def parse_delegate(*texts: str) -> str | None:
+    for text in texts:
+        match = DELEGATE_RE.search(text or "")
+        if match:
+            return match.group(1).lower()
+    return None
+
+
+def parse_waiting_since(*texts: str) -> date | None:
+    for text in texts:
+        match = WAITING_SINCE_RE.search(text or "")
+        if match:
+            return date.fromisoformat(match.group(1))
+    return None
+
+
 def todo_from_page(page: dict) -> Task:
     props = page.get("properties", {})
     title = prop_value(props.get("Task")) or ""
@@ -93,6 +123,8 @@ def todo_from_page(page: dict) -> Task:
         last_edited=_parse_edited(page),
         priority=parse_priority(notes, title),
         energy=parse_energy(notes, title),
+        delegated_to=parse_delegate(notes, title),
+        waiting_since=parse_waiting_since(notes),
     )
 
 
@@ -163,3 +195,79 @@ def match_task(tasks: list[Task], query: str) -> list[Task]:
     """Case-insensitive substring match on title, open tasks only."""
     q = query.lower().strip()
     return [t for t in tasks if t.open and q in t.title.lower()]
+
+
+def waiting_list(tasks: list[Task], now: datetime) -> list[Task]:
+    """Open tasks delegated to someone, longest wait first."""
+    out = [t for t in tasks if t.open and t.delegated_to]
+    out.sort(key=lambda t: t.wait_days(now) or 0, reverse=True)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Dependency graph over the tracker's free-text Dependencies field
+
+def dependency_names(text: str) -> list[str]:
+    """'Blocked by: A, B' / 'After: C' -> ['A', 'B', 'C']."""
+    names: list[str] = []
+    for payload in DEP_RE.findall(text or ""):
+        names.extend(part.strip() for part in payload.split(",") if part.strip())
+    return names
+
+
+def _tokens(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) > 2 and w not in STOPWORDS}
+
+
+def find_blocker(tasks: list[Task], name: str) -> Task | None:
+    """Match free-text dependency name to a task by substring or token overlap."""
+    name_l = name.lower()
+    name_tokens = _tokens(name)
+    best, best_score = None, 0.0
+    for task in tasks:
+        title_l = task.title.lower()
+        if name_l in title_l or title_l in name_l:
+            score = 1.0
+        elif name_tokens:
+            haystack = _tokens(task.title) | _tokens(task.workstream or "")
+            score = len(name_tokens & haystack) / len(name_tokens)
+        else:
+            score = 0.0
+        if score > best_score:
+            best, best_score = task, score
+    return best if best_score >= 0.6 else None
+
+
+def blocker_graph(tasks: list[Task]) -> tuple[dict[str, tuple[Task, list[Task]]], list[tuple[Task, str]]]:
+    """Map each open blocking task to the open tasks it blocks.
+
+    Returns (graph keyed by blocker id, unresolved (task, dependency-text) pairs
+    where no open task matched — done, external, or too vague).
+    """
+    open_tasks = [t for t in tasks if t.open]
+    graph: dict[str, tuple[Task, list[Task]]] = {}
+    unresolved: list[tuple[Task, str]] = []
+    for task in open_tasks:
+        for name in dependency_names(task.dependencies):
+            blocker = find_blocker(open_tasks, name)
+            if blocker and blocker.id != task.id:
+                graph.setdefault(blocker.id, (blocker, []))[1].append(task)
+            else:
+                unresolved.append((task, name))
+    return graph, unresolved
+
+
+def top_leverage(tasks: list[Task]) -> tuple[Task, list[Task]] | None:
+    """The open task whose completion unblocks the most other open tasks."""
+    graph, _ = blocker_graph(tasks)
+    if not graph:
+        return None
+    return max(graph.values(), key=lambda pair: len(pair[1]))
+
+
+def rice_score(reach: float, impact: float, confidence: float, effort: float) -> float:
+    """RICE: reach/quarter x impact (0.25-3) x confidence (0-1) / effort (person-weeks)."""
+    if effort <= 0:
+        raise ValueError("Effort must be > 0")
+    return reach * impact * confidence / effort

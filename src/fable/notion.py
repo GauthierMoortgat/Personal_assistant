@@ -67,6 +67,19 @@ class Notion:
     def append_blocks(self, block_id: str, children: list[dict]) -> dict:
         return self._request("PATCH", f"/blocks/{block_id}/children", {"children": children})
 
+    def get_block_children(self, block_id: str) -> list[dict]:
+        results: list[dict] = []
+        cursor = None
+        while True:
+            path = f"/blocks/{block_id}/children?page_size=100"
+            if cursor:
+                path += f"&start_cursor={cursor}"
+            data = self._request("GET", path)
+            results.extend(data.get("results", []))
+            if not data.get("has_more"):
+                return results
+            cursor = data["next_cursor"]
+
 
 # ---------------------------------------------------------------------------
 # Property extraction (Notion property payload -> plain values)

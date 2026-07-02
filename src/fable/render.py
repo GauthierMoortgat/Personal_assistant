@@ -61,6 +61,20 @@ def task_table(tasks: list[Task], today: date, now: datetime, title: str = "") -
     return table
 
 
+def waiting_table(tasks: list[Task], now: datetime, nudge_days: int = 3) -> Table:
+    table = Table(show_edge=False, pad_edge=False, box=None)
+    table.add_column("who", style="cyan")
+    table.add_column("task", overflow="fold", max_width=55)
+    table.add_column("waiting", justify="right")
+    for task in tasks:
+        days = task.wait_days(now)
+        label = "" if days is None else (
+            f"[bold yellow]{days}d — nudge[/bold yellow]" if days >= nudge_days else f"{days}d"
+        )
+        table.add_row(f"@{task.delegated_to}", task.title, label)
+    return table
+
+
 def one_thing(task: Task, reason: str) -> None:
     console.print()
     console.print(f"[bold]THE ONE THING[/bold]  [dim]({reason})[/dim]")
