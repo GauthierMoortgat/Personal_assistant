@@ -1,0 +1,15 @@
+# local config may contain the Notion token — never commit it
+fable.toml
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+
+# local capture fallback
+captures.md
